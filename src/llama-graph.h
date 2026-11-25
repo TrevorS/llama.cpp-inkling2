@@ -1156,6 +1156,9 @@ struct llm_graph_context {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    // conv state slot order {n_rs_seq, ..., 0}, one per buffer type of the recurrent state, so per device
+    mutable std::map<ggml_backend_buffer_type_t, ggml_tensor *> conv_slot_order;
+
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
