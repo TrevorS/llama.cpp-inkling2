@@ -70,15 +70,11 @@ static inline float e8m0_to_fp32(uint8_t x) {
 }
 
 // UE4M3: unsigned, 4 exponent bits with bias 7, 3 mantissa bits - the NVFP4 sub-block scale
+// the 7 bits placed in an fp16 give the value scaled by 2^-8, subnormals included; 0x7F (NaN) decodes to 0
 static inline float ue4m3_to_fp32(uint8_t x) {
-    if (x == 0x7F) {
-        return 0.0f;
-    }
+    const float v = (float) as_type<half>((ushort) ((x & 0x7F) << 7)) * 256.0f;
 
-    const int e = (x >> 3) & 0xF;
-    const int m = x & 0x7;
-
-    return e == 0 ? m*(1.0f/512.0f) : as_type<float>((uint32_t) (((e + 120) << 23) | (m << 20)));
+    return x == 0x7F ? 0.0f : v;
 }
 
 static inline float dot(float x, float y) {

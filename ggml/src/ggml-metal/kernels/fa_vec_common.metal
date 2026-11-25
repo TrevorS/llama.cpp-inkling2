@@ -14,6 +14,7 @@ constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
 constant bool    FC_flash_attn_ext_vec_has_sparse [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
 constant bool    FC_flash_attn_ext_vec_has_rows   [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
+constant bool    FC_flash_attn_ext_vec_has_rel    [[function_constant(FC_FLASH_ATTN_EXT_VEC + 7)]];
 template<
     typename q_t,   // query types in shared memory
     typename k_t,   // key types in shared memory
@@ -43,6 +44,8 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const char * rel_tb,
+        device const char * rel_ix,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -180,6 +183,21 @@ kernel void kernel_flash_attn_ext_vec(
         device const int * rows_list = FC_flash_attn_ext_vec_has_rows ?
             (device const int *) idx + (int64_t)(iq3%args.ne33)*args.ne11 : nullptr;
 
+        // indexed bias: the table row, the bias of the last bin and the index row of each query
+        device const float   * rel_tbr[Q];
+        device const int32_t * rel_ixr[Q];
+        float                  rel_far[Q];
+
+        if (FC_flash_attn_ext_vec_has_rel) {
+            FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                const int i1 = min(iq1*Q + qq, args.ne01 - 1);
+
+                rel_tbr[qq] = (device const float   *) (rel_tb + iq2*args.nbt1 + i1*args.nbt2 + iq3*args.nbt3);
+                rel_ixr[qq] = (device const int32_t *) (rel_ix + i1*args.nbi1 + iq3*args.nbi3);
+                rel_far[qq] = rel_tbr[qq][args.n_rel - 1];
+            }
+        }
+
         float slope = 1.0f;
 
         // ALiBi
@@ -283,6 +301,16 @@ kernel void kernel_flash_attn_ext_vec(
                 }
             }
 
+            // the bins of cell tiisg, read with the mask so that the loads overlap
+            int32_t rel_d[Q];
+            if (FC_flash_attn_ext_vec_has_rel) {
+                const int c = ic0*C + tiisg;
+
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    rel_d[qq] = c < args.ne11 ? rel_ixr[qq][c] : args.n_rel - 1;
+                }
+            }
+
             // skip -INF mask
             {
                 bool any_finite = false;
@@ -293,6 +321,24 @@ kernel void kernel_flash_attn_ext_vec(
                 }
                 if (!any_finite) {
                     continue;
+                }
+            }
+
+            // the bias of column tiisg, read before Q*K^T so that the loads overlap with it
+            float rel_b[Q];
+
+            if (FC_flash_attn_ext_vec_has_rel) {
+                const int32_t nr = args.n_rel - 1;
+
+                // most cells are in the last bin, only the others read the table
+                FOR_UNROLL (short qq = 0; qq < Q; ++qq) {
+                    const int32_t d = rel_d[qq];
+
+                    rel_b[qq] = rel_far[qq];
+
+                    if (d >= 0 && d < nr) {
+                        rel_b[qq] = rel_tbr[qq][d];
+                    }
                 }
             }
 
@@ -416,6 +462,11 @@ kernel void kernel_flash_attn_ext_vec(
                         }
 
                         ss[qq*C + NE*tx + ty] = mqk[qq][tx];
+                    }
+
+                    // indexed bias, the lane of the column holds it
+                    if (FC_flash_attn_ext_vec_has_rel) {
+                        ss[qq*C + NE*tx + ty] += simd_shuffle(rel_b[qq], NE*tx + ty);
                     }
                 }
             }

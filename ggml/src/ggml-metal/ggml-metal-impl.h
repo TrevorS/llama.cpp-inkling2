@@ -50,7 +50,7 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
-#define N_R0_NVFP4 2
+#define N_R0_NVFP4 4
 #define N_SG_NVFP4 2
 
 #define N_R0_Q2_K 4
@@ -132,6 +132,7 @@
 #define FC_MUL_MV_MMA                  2300
 #define FC_TOP_K_MASK                  2400
 #define FC_GROUP_NORM                  2500
+#define FC_L2_NORM                     2600
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -466,6 +467,12 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    uint64_t nbt1; // indexed bias table: head, query, stream
+    uint64_t nbt2;
+    uint64_t nbt3;
+    uint64_t nbi1; // indexed bias indices: query, stream
+    uint64_t nbi3;
+    int32_t  n_rel;
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -502,6 +509,12 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    uint64_t nbt1; // indexed bias table: head, query, stream
+    uint64_t nbt2;
+    uint64_t nbt3;
+    uint64_t nbi1; // indexed bias indices: query, stream
+    uint64_t nbi3;
+    int32_t  n_rel;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {
@@ -674,6 +687,16 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     float    eps;
+    // optional per-row weight multiplied in before the norm, broadcast over rows
+    int32_t  new1;
+    int32_t  new2;
+    int32_t  new3;
+    uint64_t nbw1;
+    uint64_t nbw2;
+    uint64_t nbw3;
+    // optional scale and bias applied after the norm
+    float    scale;
+    float    bias;
 } ggml_metal_kargs_l2_norm;
 
 typedef struct {
@@ -714,6 +737,146 @@ typedef struct {
     int32_t T;
     int32_t C;
 } ggml_metal_kargs_snake;
+
+// most states and queries of the depth mix kernel
+#define GGML_METAL_DEPTH_MIX_NS 8
+#define GGML_METAL_DEPTH_MIX_NQ 4
+
+typedef struct {
+    int32_t  n;     // row width
+    int32_t  k;     // stack rows, the normalized x is state k
+    int32_t  nq;
+    float    eps;
+    float    scale;
+    uint64_t nbx2;
+    uint64_t nbp1;
+    uint64_t nbp2;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nb1;
+    uint64_t nb2;
+} ggml_metal_kargs_depth_mix;
+
+// k values per lane in the tanh gate kernel, so k is at most 32*NK
+#define GGML_METAL_TANH_GATE_NK 4
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;
+    int32_t  ne11;
+    int32_t  nt;
+    uint64_t nb11;
+    uint64_t nba1;
+    uint64_t nbb1;
+    uint64_t nb1;
+} ggml_metal_kargs_tanh_gate;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbu1;
+    uint64_t nbu2;
+    uint64_t nb1;
+    uint64_t nb2;
+    float    s[4]; // the scales of the 4 SCALE nodes
+    float    b[4]; // their biases
+    uint32_t zero; // always 0, see kernel_situ_f32
+} ggml_metal_kargs_situ;
+
+typedef struct {
+    int32_t  n_kv;
+    int32_t  n_head;
+    int32_t  n_tps;
+    uint64_t nbt1;
+    uint64_t nbt2;
+    uint64_t nbs1;
+    uint64_t nbs2;
+    uint64_t nbr1;
+    uint64_t nbm1;
+    uint64_t nbm3;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_rel_bias_mask;
+
+typedef struct {
+    int32_t  n_ch;
+    int32_t  n_t;
+    int32_t  n_tokens;
+    int32_t  nc;
+    uint64_t nbx1;
+    uint64_t nbx2;
+    uint64_t nbw1;
+    uint64_t nbr1;
+    uint64_t nb1;
+    float    scale;
+    float    bias;
+} ggml_metal_kargs_ssm_conv_res;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nbs1;
+    uint64_t nbi0;
+    uint64_t nbi1;
+    uint64_t nbr1;
+    uint64_t nbr2;
+    uint64_t nb1;
+    uint64_t nb2;
+} ggml_metal_kargs_expert_scale;
+
+typedef struct {
+    int32_t  ne0;
+    uint64_t nba1;
+    uint64_t nbg1;
+    uint64_t nb1;
+} ggml_metal_kargs_sigmoid_mul;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_t;
+    uint64_t nba1; // row strides of the two inputs
+    uint64_t nbb1;
+    uint64_t nb1;
+    uint64_t nb2;
+    float    eps;
+} ggml_metal_kargs_concat_norm;
+
+#define GGML_METAL_CONV_STORE_NC_MAX 8
+
+typedef struct {
+    int32_t  n_ch;
+    int32_t  n_t;      // tokens per sequence
+    int32_t  n_tokens;
+    int32_t  nc;       // conv width, the state holds nc - 1 columns
+    int32_t  n_win;    // the last n_win tokens each store the state after them
+    int32_t  has_idx;  // the slot of window w is idx[w], else 0
+    uint64_t nbp0;     // past state [nc - 1, n_ch, n_seqs]
+    uint64_t nbp1;
+    uint64_t nbp2;
+    uint64_t nbx0;     // new inputs [n_t, n_ch, n_seqs]
+    uint64_t nbx1;
+    uint64_t nbx2;
+    uint64_t nbw1;
+    uint64_t nbr1;
+    uint64_t nb1;
+    uint64_t nbs1;     // stored state: slot, channel and sequence strides
+    uint64_t nbs2;
+    uint64_t nbs3;
+    float    scale;
+    float    bias;
+    int32_t  n_dyn;    // nc with input-dependent taps, else 0
+    int32_t  n_ch_h;   // channels per tap head
+    uint64_t nbd1;     // taps [nc, n_heads, n_tokens]: head and token strides
+    uint64_t nbd2;
+    uint64_t nbq1;     // second residual, added after the scale
+    int32_t  has_res2;
+    uint32_t zero;     // always 0, see kernel_situ_f32
+} ggml_metal_kargs_conv_store;
 
 typedef struct {
     int32_t  IC;

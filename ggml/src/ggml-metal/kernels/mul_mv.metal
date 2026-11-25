@@ -1179,6 +1179,163 @@ template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_m
 template [[host_name("kernel_mul_mv_f32_bf16_4")]]  kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float,  bfloat>;
 #endif
 
+// NR1 src1 rows per threadgroup share the src0 reads; each row has the arithmetic of kernel_mul_mv_t_t_4
+template<typename T0, typename T04, short NR1>
+kernel void kernel_mul_mv_t_t_4_r1(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short NR0 = 2;
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB  = 32;
+    constexpr short NF  = 16;
+    constexpr short NF4 = NF/4;
+
+    const int nb = args.ne00/NB;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y*NR1;
+    const int im = tgpig.z;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    // rows past ne11 read the last row and do not write
+    device const float4 * y4[NR1];
+    FOR_UNROLL (short col = 0; col < NR1; ++col) {
+        const uint64_t offset1 = min(r1 + col, args.ne11 - 1)*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+        y4[col] = (device const float4 *) (src1 + offset1);
+    }
+
+    device const T0  * ax [NR0];
+    device const T04 * ax4[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = min(r0 + row, args.ne01 - 1)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+
+        ax [row] = (device const T0  *) ((device char *) src0 + offset0);
+        ax4[row] = (device const T04 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR1][NR0] = { { 0.f } };
+
+    const short ix = tiisg/(NW/NF);
+    const short il = tiisg%(NW/NF);
+
+    const int ib0 = sgitg*NF + ix;
+
+    float4 xl4[NR0][NF4];
+
+    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                xl4[row][i] = float4(xb4[i]);
+            }
+        }
+
+        FOR_UNROLL (short col = 0; col < NR1; ++col) {
+            device const float4 * yb4 = y4[col] + (ib*NB + il*NF)/4;
+
+            float4 yl4[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[i];
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(xl4[row][i], yl4[i]);
+                }
+
+                sumf[col][row] += sumq;
+            }
+        }
+    }
+
+    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
+        for (short col = 0; col < NR1; ++col) {
+            for (short row = 0; row < NR0; row++) {
+                sumf[col][row] += ax[row][i] * ((device const float *) y4[col])[i];
+            }
+        }
+    }
+
+    // same reduction as helper_mv_reduce_and_write, for all NR1*NR0 rows with one pair of barriers
+    constexpr short NK = NR1*NR0;
+
+    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+
+    FOR_UNROLL (short k = 0; k < NK; ++k) {
+        if (sgitg == 0) {
+            shmem_f32[NW*k + tiisg] = 0.0f;
+        }
+
+        sumf[k/NR0][k%NR0] = simd_sum(sumf[k/NR0][k%NR0]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        FOR_UNROLL (short k = 0; k < NK; ++k) {
+            shmem_f32[NW*k + sgitg] = sumf[k/NR0][k%NR0];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short k = sgitg; k < NK; k += NSG) {
+        const short col = k/NR0;
+        const short row = k%NR0;
+
+        if (r1 + col >= args.ne11 || r0 + row >= args.ne01) {
+            continue;
+        }
+
+        const float tot = simd_sum(shmem_f32[NW*k + tiisg]);
+
+        if (tiisg == 0) {
+            device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(r1 + col)*args.ne0;
+
+            dst_f32[r0 + row] = tot;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mv_t_t_4_r1<half, half4, 2>) mul_mv_t_t_4_r1;
+
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_2")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 2>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_3")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 3>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_4")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 4>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_5")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 5>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_6")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 6>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_7")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 7>;
+template [[host_name("kernel_mul_mv_f32_f32_4_r1_8")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<float, float4, 8>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_2")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 2>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_3")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 3>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_4")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 4>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_5")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 5>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_6")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 6>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_7")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 7>;
+template [[host_name("kernel_mul_mv_f16_f32_4_r1_8")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<half,  half4, 8>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_2")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 2>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_3")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 3>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_4")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 4>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_5")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 5>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_6")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 6>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_7")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 7>;
+template [[host_name("kernel_mul_mv_bf16_f32_4_r1_8")]] kernel mul_mv_t_t_4_r1 kernel_mul_mv_t_t_4_r1<bfloat, bfloat4, 8>;
+#endif
+
 template<typename T0, typename T1, typename args_t>
 void kernel_mul_mv_t_t_short_impl(
         args_t args,
@@ -3190,54 +3347,45 @@ void kernel_mul_mv_nvfp4_f32_impl(
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
     const short ix = tiisg/2;  // 0...15
-    const short it = tiisg%2;  // 0 or 1
+    const short it = tiisg%2;  // 0 or 1, each thread takes 2 of the 4 sub-blocks
 
     float4 yl[8];
     float sumf[NR0]={0.f};
 
-    device const float * yb = y + ix*QK_NVFP4 + it*32;
+    device const float * yb = y + ix*QK_NVFP4 + it*2*QK_NVFP4_SUB;
 
-    // note: just the check `ib < nb` is enough, but adding the redundant `&& ib < ns01` check makes the kernel a bit faster
-    //       no idea why that is - needs some deeper investigation [TAG_MUL_MV_WEIRD]
     for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
         device const float4 * y4 = (device const float4 *) yb;
 
-        yl[0] = y4[0];
-        yl[1] = y4[2];
-        yl[2] = y4[1];
-        yl[3] = y4[3];
-        yl[4] = y4[4];
-        yl[5] = y4[6];
-        yl[6] = y4[5];
-        yl[7] = y4[7];
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            yl[i] = y4[i];
+        }
 
         FOR_UNROLL (short row = 0; row < NR0; row++) {
             device const block_nvfp4 & xb = x[row*ns01 + ib];
 
-            // a block is 36 bytes, so its 16 quant bytes are 4-byte aligned and read as four words
-            device const uint32_t * pw = (device const uint32_t *)(xb.qs + 16*it);
+            // blocks are 36 bytes, so the scales and the quants are 4-byte aligned: read them as words
+            const uint32_t d4 = *((device const uint32_t *) xb.d);
+            device const uint32_t * qw = (device const uint32_t *) xb.qs + 4*it;
 
-            const uint32_t w0 = pw[0];
-            const uint32_t w1 = pw[1];
-            const uint32_t w2 = pw[2];
-            const uint32_t w3 = pw[3];
+            float sumq = 0.f;
 
-            float4 acc1 = yl[0]*e2m1_lo4(w0);
-            float4 acc2 = yl[1]*e2m1_hi4(w0);
-            float4 acc3 = yl[2]*e2m1_lo4(w1);
-            float4 acc4 = yl[3]*e2m1_hi4(w1);
+            FOR_UNROLL (short s = 0; s < 2; ++s) {
+                const uint32_t w0 = qw[2*s + 0];
+                const uint32_t w1 = qw[2*s + 1];
 
-            float4 acc5 = yl[4]*e2m1_lo4(w2);
-            float4 acc6 = yl[5]*e2m1_hi4(w2);
-            float4 acc7 = yl[6]*e2m1_lo4(w3);
-            float4 acc8 = yl[7]*e2m1_hi4(w3);
+                float4 acc1 = yl[4*s + 0]*e2m1_lo4(w0);
+                float4 acc2 = yl[4*s + 1]*e2m1_lo4(w1);
+                float4 acc3 = yl[4*s + 2]*e2m1_hi4(w0);
+                float4 acc4 = yl[4*s + 3]*e2m1_hi4(w1);
 
-            acc1 = (acc1 + acc3) + (acc2 + acc4);
-            acc5 = (acc5 + acc7) + (acc6 + acc8);
+                acc1 = (acc1 + acc3) + (acc2 + acc4);
 
-            // 16384 undoes the 2^-14 of the decode
-            sumf[row] += ue4m3_to_fp32(xb.d[2*it + 0])*16384.0f*((acc1[0] + acc1[1]) + (acc1[2] + acc1[3])) +
-                         ue4m3_to_fp32(xb.d[2*it + 1])*16384.0f*((acc5[0] + acc5[1]) + (acc5[2] + acc5[3]));
+                // 16384 undoes the 2^-14 of the decode
+                sumq += (ue4m3_to_fp32((d4 >> (8*(2*it + s))) & 0xFF)*16384.0f) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+            }
+
+            sumf[row] += sumq;
         }
 
         yb += 16 * QK_NVFP4;

@@ -19,8 +19,10 @@ extern "C" {
 struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
-// (also the maximum length of a packed fusion group during graph optimization)
-#define GGML_METAL_FUSION_MAX 16
+#define GGML_METAL_FUSION_MAX 48
+
+// the maximum number of nodes of back-to-back patterns packed together during graph optimization
+#define GGML_METAL_FUSION_CHAIN 16
 
 typedef enum ggml_metal_fusion_mode {
     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
@@ -43,6 +45,16 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+    GGML_METAL_FUSION_L2_NORM,      // [MUL +] L2_NORM [+ SCALE] (per-row weight before, scale after)
+    GGML_METAL_FUSION_SSM_CONV_RES, // SSM_CONV + ADD + SCALE (short conv with a residual)
+    GGML_METAL_FUSION_REL_BIAS_MASK, // SUB + CONT + GET_ROWS + CONT + CPY + ADD + CPY (per-head F16 mask from a relative bias table)
+    GGML_METAL_FUSION_TANH_GATE,    // MUL_MAT + TANH + MUL + SUB + MUL_MAT + TANH + MUL + ADD (a - tanh(wf*x)*a + tanh(wg*x)*b)
+    GGML_METAL_FUSION_DEPTH_MIX,    // RMS_NORM + CONCAT + CONT + MUL_MAT + SOFT_MAX + MUL_MAT (softmax attention over a few rows)
+    GGML_METAL_FUSION_SITU,         // SCALE + TANH + SCALE + SIGMOID + MUL + SCALE + TANH + SCALE + MUL (gated SITU activation)
+    GGML_METAL_FUSION_CONV_STORE,   // CONCAT + CPY/SET_ROWS + SSM_CONV + ADD + SCALE (short conv over the state and new inputs, store the new state)
+    GGML_METAL_FUSION_EXPERT_SCALE, // REPEAT + GET_ROWS + MUL (multiply each expert output by the scale of its expert)
+    GGML_METAL_FUSION_SIGMOID_MUL,  // SIGMOID + MUL (a*sigmoid(g))
+    GGML_METAL_FUSION_CONCAT_NORM,  // CONCAT + RMS_NORM (RMS norm of the rows of two tensors, as rows of one)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp

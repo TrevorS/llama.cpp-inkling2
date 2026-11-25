@@ -4730,6 +4730,470 @@ struct test_add_unary_mul : public test_case {
     }
 };
 
+// clip of Inkling 2: s*l2_norm(x*w), with the weight multiply and the scale optional
+struct test_l2_norm_fuse : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool with_mul;
+    const bool with_scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "L2_NORM_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_mul, with_scale);
+    }
+
+    test_l2_norm_fuse(std::array<int64_t, 4> ne = {128, 24, 1, 1}, bool with_mul = true, bool with_scale = true)
+        : ne(ne), with_mul(with_mul), with_scale(with_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * out = x;
+        if (with_mul) {
+            out = ggml_mul(ctx, out, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[1]));
+        }
+        out = ggml_l2_norm(ctx, out, 1e-6f);
+        if (with_scale) {
+            out = ggml_scale(ctx, out, 22.6f);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// short conv with a residual: s*(res + ssm_conv(x, w)), as built for Inkling 2
+struct test_ssm_conv_res_fuse : public test_case {
+    const int64_t n_ch;
+    const int64_t n_t;
+    const int64_t n_s;
+    const int64_t nc;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_RES_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_ch, n_t, n_s, nc);
+    }
+
+    test_ssm_conv_res_fuse(int64_t n_ch = 1024, int64_t n_t = 1, int64_t n_s = 1, int64_t nc = 4)
+        : n_ch(n_ch), n_t(n_t), n_s(n_s), nc(nc) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc - 1 + n_t, n_ch, n_s);
+        ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, n_ch);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_t*n_s);
+
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_ch, n_t*n_s);
+        out = ggml_scale(ctx, ggml_add(ctx, res, out), 0.33f);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// relative bias mask fusion: a per-head F16 mask from a bias table gathered by distance, as built for Inkling 2
+struct test_rel_bias_mask_fuse : public test_case {
+    const int64_t n_rel;
+    const int64_t n_head;
+    const int64_t n_kv;
+    const int64_t n_tokens;
+    const int64_t n_stream;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REL_BIAS_MASK_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_rel, n_head, n_kv, n_tokens, n_stream);
+    }
+
+    test_rel_bias_mask_fuse(int64_t n_rel = 1025, int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 1, int64_t n_stream = 1)
+        : n_rel(n_rel), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_tensor * rel   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_tensor * mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tokens/n_stream, 1, n_stream);
+
+        ggml_tensor * t = ggml_sub(ctx, table, ggml_reshape_3d(ctx, sinks, 1, n_head, n_tokens));
+        t = ggml_cont(ctx, ggml_permute(ctx, t, 1, 0, 2, 3));
+
+        ggml_tensor * kq_b = ggml_get_rows(ctx, t, rel);
+        kq_b = ggml_reshape_4d(ctx, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+        kq_b = ggml_cont(ctx, ggml_permute(ctx, kq_b, 2, 0, 1, 3));
+
+        ggml_tensor * out = ggml_cast(ctx, ggml_add(ctx, kq_b, ggml_cast(ctx, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % n_rel;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// tanh gate fusion: a - tanh(wf*x)*a + tanh(wg*x)*b, the loop controller of Inkling 2
+struct test_tanh_gate_fuse : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t n;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TANH_GATE_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return type == GGML_TYPE_F32 ? 1e-6 : 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, n, n_tokens);
+    }
+
+    test_tanh_gate_fuse(ggml_type type = GGML_TYPE_F32, int64_t k = 64, int64_t n = 256, int64_t n_tokens = 1)
+        : type(type), k(k), n(n), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wf = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * wg = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+
+        ggml_tensor * f = ggml_tanh(ctx, ggml_mul_mat(ctx, wf, x));
+        ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, wg, x));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_sub(ctx, a, ggml_mul(ctx, f, a)), ggml_mul(ctx, g, b));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// depth mix fusion: softmax attention of a few queries over a stack of rows and rms_norm(x), as built for Inkling 2
+struct test_depth_mix_fuse : public test_case {
+    const int64_t n;
+    const int64_t k;
+    const int64_t nq;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DEPTH_MIX_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, k, nq, n_tokens);
+    }
+
+    test_depth_mix_fuse(int64_t n = 2304, int64_t k = 3, int64_t nq = 1, int64_t n_tokens = 1)
+        : n(n), k(k), nq(nq), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * prev = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, k, n_tokens);
+        ggml_tensor * q    = n_tokens == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, nq) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, nq, n_tokens);
+
+        ggml_tensor * states = ggml_concat(ctx, prev, ggml_rms_norm(ctx, ggml_reshape_3d(ctx, x, n, 1, n_tokens), 1e-6f), 1);
+
+        ggml_tensor * scores = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, q), nullptr, 1.0f/sqrtf(n), 0.0f);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// SITU activation on the gate and up halves of a gate_up tensor, as in build_moe_ffn
+struct test_situ_fuse : public test_case {
+    const int64_t n_ff;
+    const int64_t n_used;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SITU_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ff, n_used, n_tokens);
+    }
+
+    test_situ_fuse(int64_t n_ff = 1152, int64_t n_used = 8, int64_t n_tokens = 1)
+        : n_ff(n_ff), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*n_ff, n_used, n_tokens);
+
+        ggml_tensor * gate = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
+        ggml_tensor * up   = ggml_view_3d(ctx, gate_up, n_ff, n_used, n_tokens, gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
+
+        const float beta = 6.0f;
+        const float lb   = 25.0f;
+
+        ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f/beta)), beta);
+        act = ggml_mul(ctx, act, ggml_sigmoid(ctx, gate));
+        up  = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f/lb)), lb);
+
+        ggml_tensor * out = ggml_mul(ctx, act, up);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// short conv over [past state | new inputs] with a residual, storing the last nc - 1 columns as the new state (Inkling 2 convolve)
+struct test_conv_store_fuse : public test_case {
+    const int64_t n_ch;
+    const int64_t n_t;
+    const int64_t nc;
+    const bool    res2; // a second residual, added after the scale
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STORE_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_ch, n_t, nc, res2);
+    }
+
+    test_conv_store_fuse(int64_t n_ch = 1024, int64_t n_t = 1, int64_t nc = 4, bool res2 = false)
+        : n_ch(n_ch), n_t(n_t), nc(nc), res2(res2) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_t);
+        ggml_tensor * past  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc - 1, n_ch, 1);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, n_ch);
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (nc - 1)*n_ch, 2);
+
+        ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_ch, n_t, 1)), 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, x, nc - 1, n_ch, 1, x->nb[1], x->nb[2], ggml_row_size(x->type, n_t));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, (nc - 1)*n_ch, 1, state->nb[1], state->nb[1]);
+        ggml_tensor * cpy  = ggml_cpy(ctx, last, cell);
+
+        // the store goes into the graph before the conv, as the model builds them
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_ch, n_t);
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 0.3f);
+        if (res2) {
+            out = ggml_add(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_t), out);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// expert outputs times the scale of their expert, gathered from a repeated [1, n_expert] column (build_lora_mm_id)
+struct test_expert_scale_fuse : public test_case {
+    const int64_t n;
+    const int64_t n_expert;
+    const int64_t n_used;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "EXPERT_SCALE_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, n_expert, n_used, n_tokens);
+    }
+
+    test_expert_scale_fuse(int64_t n = 2304, int64_t n_expert = 128, int64_t n_used = 8, int64_t n_tokens = 1)
+        : n(n), n_expert(n_expert), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * res = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, n_used, n_tokens);
+        ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert, n_tokens);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * sel = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+
+        ggml_tensor * s = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, w_s, 1, n_expert, 1), 1, n_expert, n_tokens, 1);
+        ggml_tensor * out = ggml_mul(ctx, res, ggml_get_rows(ctx, s, sel));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) {
+                    continue;
+                }
+                // a permutation of the experts per token, so the first n_used are distinct
+                std::vector<int32_t> data(t->ne[0]*t->ne[1]);
+                for (int64_t r = 0; r < t->ne[1]; r++) {
+                    for (int64_t i = 0; i < t->ne[0]; i++) {
+                        data[r*t->ne[0] + i] = i;
+                    }
+                    std::shuffle(data.begin() + r*t->ne[0], data.begin() + (r + 1)*t->ne[0], rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// the short conv with input-dependent taps per head and lag, as in the Inkling 2 full-attention layers
+struct test_conv_store_dyn_fuse : public test_case {
+    const int64_t n_ch;
+    const int64_t n_heads;
+    const int64_t n_t;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_STORE_DYN_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_ch, n_heads, n_t);
+    }
+
+    test_conv_store_dyn_fuse(int64_t n_ch = 1024, int64_t n_heads = 8, int64_t n_t = 1)
+        : n_ch(n_ch), n_heads(n_heads), n_t(n_t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nc = 4;
+
+        ggml_tensor * cur   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_t);
+        ggml_tensor * past  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc - 1, n_ch, 1);
+        ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, n_ch);
+        ggml_tensor * dyn   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nc, n_heads, n_t);
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (nc - 1)*n_ch, 2);
+
+        ggml_tensor * x = ggml_concat(ctx, past, ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, n_ch, n_t, 1)), 0);
+
+        ggml_tensor * last = ggml_view_3d(ctx, x, nc - 1, n_ch, 1, x->nb[1], x->nb[2], ggml_row_size(x->type, n_t));
+        ggml_tensor * cell = ggml_view_2d(ctx, state, (nc - 1)*n_ch, 1, state->nb[1], state->nb[1]);
+        ggml_tensor * cpy  = ggml_cpy(ctx, last, cell);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cpy);
+        }
+
+        ggml_tensor * out = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), n_ch, n_t);
+        for (int64_t lag = 0; lag < nc; ++lag) {
+            ggml_tensor * tap    = ggml_view_3d(ctx, dyn, 1, n_heads, n_t, dyn->nb[1], dyn->nb[2], lag*dyn->nb[0]);
+            ggml_tensor * window = ggml_view_3d(ctx, x, n_t, n_ch, 1, x->nb[1], x->nb[2], (nc - 1 - lag)*x->nb[0]);
+            window = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, window)), n_ch/n_heads, n_heads, n_t);
+            out = ggml_add(ctx, out, ggml_reshape_2d(ctx, ggml_mul(ctx, window, tap), n_ch, n_t));
+        }
+        out = ggml_scale(ctx, ggml_add(ctx, cur, out), 0.3f);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// a*sigmoid(g), the gated attention output
+struct test_sigmoid_mul_fuse : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SIGMOID_MUL_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n, n_tokens);
+    }
+
+    test_sigmoid_mul_fuse(int64_t n = 3072, int64_t n_tokens = 1) : n(n), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * out = ggml_mul(ctx, a, ggml_sigmoid(ctx, g));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// RMS norm of the rows of two tensors stacked in dim 0, or as [n, 1, n_tokens] views in dim 1 as in the Inkling 2 controllers
+struct test_concat_norm_fuse : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+    const int     dim;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_NORM_FUSE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, n_tokens, dim);
+    }
+
+    test_concat_norm_fuse(int64_t n = 2304, int64_t n_tokens = 1, int dim = 1) : n(n), n_tokens(n_tokens), dim(dim) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * out = dim == 0 ?
+            ggml_reshape_3d(ctx, ggml_concat(ctx, a, b, 0), n, 2, n_tokens) :
+            ggml_concat(ctx, ggml_reshape_3d(ctx, a, n, 1, n_tokens), ggml_reshape_3d(ctx, b, n, 1, n_tokens), 1);
+        out = ggml_rms_norm(ctx, out, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -9575,6 +10039,51 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
+// indexed bias on the base test shapes: score[i, j] += table[rel[i, j], h, j], with rel from shuffled cell positions
+struct test_flash_attn_ext_rel : public test_flash_attn_ext {
+    static constexpr int64_t n_rel = 17;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",n_rel=" + std::to_string(n_rel);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        ggml_tensor * q   = out->src[0];
+
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, q->ne[2], q->ne[1]*q->ne[3]);
+        ggml_set_name(table, "rel_table");
+
+        ggml_tensor * rel = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
+        ggml_set_name(rel, "rel");
+
+        ggml_flash_attn_ext_add_indexed_bias(out, table, rel);
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        init_tensor_uniform(ggml_get_tensor(ctx, "rel_table"), -4.0f, 4.0f);
+
+        // cells in a shuffled order, queries after most of them: the distances are negative, in the table, and past it
+        ggml_tensor * rel = ggml_get_tensor(ctx, "rel");
+        const int64_t n_q = rel->ne[1];
+        std::vector<int32_t> idx(kv*n_q);
+        for (int64_t j = 0; j < n_q; ++j) {
+            const int64_t qp = kv - nb + j % nb;
+            for (int64_t i = 0; i < kv; ++i) {
+                const int64_t d = qp - (i*7919) % kv;
+                idx[j*kv + i] = (int32_t) (d >= 0 && d < n_rel - 1 ? d : n_rel - 1);
+            }
+        }
+        ggml_backend_tensor_set(rel, idx.data(), 0, idx.size()*sizeof(int32_t));
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -11218,6 +11727,65 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     // a unary op with no fused kernel must fall back to the three-op chain
     test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int64_t n_tokens : { 1, 3, 8, 17, 100 }) {
+            test_cases.emplace_back(new test_tanh_gate_fuse(type,  64, 2304, n_tokens));
+            test_cases.emplace_back(new test_tanh_gate_fuse(type, 100,   37, n_tokens));
+            test_cases.emplace_back(new test_tanh_gate_fuse(type, 128,   16, n_tokens));
+        }
+        // k above the kernel limit: the matcher must reject the fusion
+        test_cases.emplace_back(new test_tanh_gate_fuse(type, 160, 64, 2));
+    }
+
+    for (int64_t n_tokens : { 1, 3, 8, 17 }) {
+        for (auto [k, nq] : std::vector<std::array<int64_t, 2>>{ {1, 1}, {2, 3}, {3, 4}, {4, 1}, {7, 2} }) {
+            test_cases.emplace_back(new test_depth_mix_fuse(2304, k, nq, n_tokens));
+        }
+        test_cases.emplace_back(new test_depth_mix_fuse(36, 2, 2, n_tokens));
+    }
+    // more states or queries than the kernel holds: the matcher must reject the fusion
+    test_cases.emplace_back(new test_depth_mix_fuse(64, 8, 1, 2));
+    for (int n_tokens : { 1, 3, 8, 17 }) {
+        test_cases.emplace_back(new test_situ_fuse(1152, 8, n_tokens));
+    }
+    test_cases.emplace_back(new test_situ_fuse(36, 3, 2));
+    for (int n_t : { 1, 3, 8, 33 }) {
+        test_cases.emplace_back(new test_conv_store_fuse(1024, n_t, 4));
+        test_cases.emplace_back(new test_conv_store_fuse(2304, n_t, 4, true));
+    }
+    test_cases.emplace_back(new test_conv_store_fuse(300, 2, 3));
+    test_cases.emplace_back(new test_conv_store_fuse(300, 2, 3, true));
+    for (int n_tokens : { 1, 3, 8, 20 }) {
+        test_cases.emplace_back(new test_expert_scale_fuse(2304, 128, 8, n_tokens));
+    }
+    for (int n_tokens : { 1, 3, 8, 20 }) {
+        test_cases.emplace_back(new test_sigmoid_mul_fuse(3072, n_tokens));
+        test_cases.emplace_back(new test_concat_norm_fuse(2304, n_tokens, 0));
+        test_cases.emplace_back(new test_concat_norm_fuse(2304, n_tokens, 1));
+    }
+    test_cases.emplace_back(new test_concat_norm_fuse(64, 2, 0));
+    test_cases.emplace_back(new test_concat_norm_fuse(64, 2, 1));
+    for (int n_t : { 1, 3, 8, 21 }) {
+        test_cases.emplace_back(new test_conv_store_dyn_fuse(1024, 8, n_t));
+    }
+    test_cases.emplace_back(new test_depth_mix_fuse(64, 2, 5, 2));
+
+    for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{ {128, 24, 1, 1}, {16, 24, 3, 1}, {128, 8, 5, 2}, {36, 7, 2, 1} }) {
+        test_cases.emplace_back(new test_l2_norm_fuse(ne, true,  true));
+        test_cases.emplace_back(new test_l2_norm_fuse(ne, true,  false));
+        test_cases.emplace_back(new test_l2_norm_fuse(ne, false, true));
+    }
+
+    for (auto [n_ch, n_t, n_s] : std::vector<std::array<int64_t, 3>>{ {1024, 1, 1}, {2304, 3, 1}, {37, 5, 2}, {300, 1, 4} }) {
+        test_cases.emplace_back(new test_ssm_conv_res_fuse(n_ch, n_t, n_s, 4));
+    }
+    test_cases.emplace_back(new test_ssm_conv_res_fuse(64, 2, 1, 3));
+
+    for (auto [n_kv, n_tokens, n_stream] : std::vector<std::array<int64_t, 3>>{ {256, 1, 1}, {1000, 3, 1}, {512, 8, 2}, {4096, 17, 1} }) {
+        test_cases.emplace_back(new test_rel_bias_mask_fuse(1025, 24, n_kv, n_tokens, n_stream));
+        test_cases.emplace_back(new test_rel_bias_mask_fuse(  37,  5, n_kv, n_tokens, n_stream));
+    }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
@@ -13907,6 +14475,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // indexed bias on the base test shapes: vec and matrix kernels, a partial KV block, and 2 streams
+    for (int64_t nb : { 1, 3, 8, 32, 75 }) {
+        for (int64_t kv : { 113, 1024 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_rel(128, 128, 8, {3, 1}, kv, nb, true, nb == 3, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext_rel(128, 128, 4, {3, 2}, 256, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
     // mask broadcast over Q heads and batches

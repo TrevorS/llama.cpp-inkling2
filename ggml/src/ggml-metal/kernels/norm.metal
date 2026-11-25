@@ -173,6 +173,55 @@ kernel void kernel_rms_norm_fuse_impl(
     }
 }
 
+// kernel_rms_norm_f32_4 over the rows of [a | b] concatenated in dim 0 and split back into rows of ne00: row 0 of a token is a, row 1 is b
+// same threads and reduction as kernel_rms_norm_f32_4, so the result matches the unfused nodes
+kernel void kernel_concat_rms_norm_f32_4(
+        constant ggml_metal_kargs_concat_norm & args,
+        device const char * a,
+        device const char * b,
+        device       char * dst,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+    const int i02 = tgpig.y;
+
+    device const float4 * x = (device const float4 *) (i01 == 0 ? a + i02*args.nba1 : b + i02*args.nbb1);
+
+    float sumf = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        sumf += dot(x[i00], x[i00]);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.ne00;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    device float4 * y = (device float4 *) (dst + i02*args.nb2 + i01*args.nb1);
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        y[i00] = (x[i00]*scale);
+    }
+}
+
 typedef decltype(kernel_rms_norm_fuse_impl<float4, 1>) kernel_rms_norm_fuse_t;
 
 template [[host_name("kernel_rms_norm_f32")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 1>;
@@ -183,11 +232,16 @@ template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_f
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
 
+constant bool FC_l2_norm_mul   [[function_constant(FC_L2_NORM + 0)]];
+constant bool FC_l2_norm_scale [[function_constant(FC_L2_NORM + 1)]];
+
+// with FC_l2_norm_mul the input is x*w, with FC_l2_norm_scale the output is scale*y + bias (fused MUL and SCALE nodes)
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(
         constant ggml_metal_kargs_l2_norm & args,
         device const char * src0,
         device       char * dst,
+        device const char * src1,
         threadgroup float * shmem_f32 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
@@ -204,12 +258,14 @@ kernel void kernel_l2_norm_impl(
 
     device const T0 * x = (device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
     device       T  * y = (device       T  *) (dst  + i03*args.nb3  + i02*args.nb2  + i01*args.nb1);
+    device const T0 * w = (device const T0 *) (src1 + (i03%args.new3)*args.nbw3 + (i02%args.new2)*args.nbw2 + (i01%args.new1)*args.nbw1);
 
     float sumf = 0.0f;
 
     // parallel sum
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
-        sumf += dot(x[i00], x[i00]);
+        const T0 v = FC_l2_norm_mul ? x[i00]*w[i00] : x[i00];
+        sumf += dot(v, v);
     }
     sumf = simd_sum(sumf);
 
@@ -227,7 +283,9 @@ kernel void kernel_l2_norm_impl(
     const float scale = 1.0f/max(sqrt(sumf), args.eps);
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
-        y[i00] = x[i00] * scale;
+        const T0 v = FC_l2_norm_mul ? x[i00]*w[i00] : x[i00];
+        const T  r = v * scale;
+        y[i00] = FC_l2_norm_scale ? args.scale*r + args.bias : r;
     }
 }
 

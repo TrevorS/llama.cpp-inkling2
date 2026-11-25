@@ -46,7 +46,8 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
+    // from 16 tokens the mat-mat kernel is faster for a 128-expert MoE (measured on an M4 Max)
+    return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 16;
 }
 
 // the most src1 rows of the few-row MMA kernels
@@ -142,17 +143,58 @@ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     }
 }
 
-bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
+// the most src1 rows of the few-row MMA kernels for this type
+// BF16: the few-row MMA kernel beats the mat-mat kernel up to about 128 rows (measured on an M4 Max)
+static int64_t ggml_metal_mul_mv_mma_rows_max(enum ggml_type type) {
+    return type == GGML_TYPE_BF16 ? 128 : GGML_METAL_MMA_ROWS_MAX;
+}
+
+// the few-row MMA kernels can compute this mat-mul, for any row count
+static bool ggml_metal_mul_mat_mma_ok(const struct ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
 
     // the batch shape goes into int16 function constants
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
-    return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
-        src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
+    return ggml_metal_mul_mat_mma_type_ok(op) && batch_ok && src1->type == GGML_TYPE_F32 &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;
+}
+
+// large BF16 weights use the few-row MMA kernel for any small batch, also for one row
+// the kernel does not change with the row count, so each row gets the same result as a batch of one row
+static bool ggml_metal_mul_mat_mma_all_rows(const struct ggml_tensor * op) {
+    return op->src[0]->type == GGML_TYPE_BF16 && op->src[0]->ne[1] >= 1024 && ggml_metal_mul_mat_mma_ok(op);
+}
+
+// a few src1 rows of float weights use the mat-vec kernel, so each row gets the same result as a batch of one row
+bool ggml_metal_op_mul_mat_use_mv_rows(const struct ggml_tensor * op) {
+    if (ggml_metal_mul_mat_mma_all_rows(op)) {
+        return false;
+    }
+
+    switch (op->src[0]->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            return op->src[1]->ne[1] >= 2 && op->src[1]->ne[1] <= 8;
+        default:
+            return false;
+    }
+}
+
+bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
+    const ggml_type type = op->src[0]->type;
+    const int64_t   ne11 = op->src[1]->ne[1];
+
+    if (ggml_metal_op_mul_mat_use_mv_rows(op) || !ggml_metal_mul_mat_mma_ok(op)) {
+        return false;
+    }
+
+    const int64_t rows_min = ggml_metal_mul_mat_mma_all_rows(op) ? 1 : ggml_metal_mul_mv_mma_rows_min(type);
+
+    return ne11 >= rows_min && ne11 <= ggml_metal_mul_mv_mma_rows_max(type);
 }
 
 bool ggml_metal_op_mul_mat_may_use_mma(const struct ggml_tensor * op) {
