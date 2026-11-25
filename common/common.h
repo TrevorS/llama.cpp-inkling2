@@ -424,7 +424,14 @@ struct common_params_speculative {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        // ngram-mod drafts in the same list are verified with the same rollback slots
+        const bool has_ngram_mod = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != types.end();
+
+        return (uint32_t) std::max(draft.n_max, has_ngram_mod ? ngram_mod.n_max : 0);
     }
 };
 
