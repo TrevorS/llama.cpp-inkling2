@@ -1,3 +1,39 @@
+# llama.cpp, Inkling 2 fork
+
+This branch is upstream llama.cpp ([`9c003a97a`](https://github.com/ggml-org/llama.cpp/commit/9c003a97a)) plus 8 commits that make Inkling 2 Mini fast on Apple Metal. Speculative output stays exact: with speculation on, the text is the same as plain decode, and a batch of 1-8 rows gives the same logits as a batch of one. The tools, the checks and the review notes are in [`scripts/inkling2`](scripts/inkling2/README.md).
+
+## Changes from upstream
+
+- `kv-cache`: when a sliding-window (SWA) tail is removed, continue at the first removed cell. Upstream reuses wrong cells after rejected drafts at the end of the ring.
+- `graph`: layers on one device share the slot order of the conv state.
+- `common`: size the rollback slots for n-gram drafts.
+- `server`: do not start new drafts while more than one slot generates.
+- `metal`: Inkling 2 kernels and fusions. Depth mix, short conv, loop controllers, concat + norm and other chains run as fused kernels: 2105 dispatches per decode step instead of 3541. NVFP4 mat-vec reads whole words. The NVFP4 MoE mat-mul keeps `half` operands (upstream uses `bfloat`, mean KLD 0.0016). Up to 8 queries, flash attention uses the dense mask, so each row is equal to a batch of one. `GGML_METAL_N_CB` overrides the number of command buffers.
+- `inkling2`: keep the depth mix layout and the node order that the Metal fusions need.
+- `scripts/inkling2`: serving (`serve.sh`: DSpark draft k=3 plus n-gram drafts by default), exactness checks, KLD, benches, sweeps and profilers.
+
+Taken from upstream instead of the old fork: the DSpark/DFlash draft code, the chunked command buffers (2.7% faster decode than our 8 buffers), the NVFP4 type and the indexed bias in flash attention.
+
+## Results (M4 Max, Inkling 2 Mini UD-Q8_K_XL)
+
+| | upstream | this branch |
+|---|---|---|
+| pp512, depth 0 / 8k / 32k (tok/s) | 593 / 360 / 195 | 900 / 742 / 581 |
+| tg128, depth 0 / 8k / 32k (tok/s) | 37.0 / 34.8 / 31.9 | 47.6 / 45.3 / 42.2 |
+| server decode, edit prompts, n-gram + k3 (tok/s) | | 106.2 (45.8 with speculation off) |
+
+Checks: decode logits bitwise equal to the old fork and to the previous rebase, prefill KLD 0, `exact-matrix.sh` 27/27, `test-backend-ops` 20407/20407, `identity.sh` equal to plain decode.
+
+## Next
+
+1. MoE mat-vec for small batches that reads each expert once per step. In a 4-token verify step the NVFP4 experts take 38% of GPU time, because each route reads its expert again. Keeps each route's arithmetic order, so bitwise equal.
+2. Store the experts of layers 20-23 as MXFP8. The BF16 weights are exact in E4M3 x E8M0 (4096 of 4096 sampled blocks), so the change is lossless and halves their bytes.
+3. Spread the fused depth mix kernel over more threadgroups at decode (7% of decode time on one threadgroup).
+4. Tune the BF16 K/V and NVFP4 down projection mat-vecs (341 and 349 GB/s).
+5. Cheaper draft: adaptive draft depth, a quantized draft head, the DFlash2 drafter (upstream #33049).
+
+---
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
