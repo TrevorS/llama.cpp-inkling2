@@ -491,6 +491,18 @@ public:
         }
     }
 
+    // the cell of the lowest position >= p0 of sequence seq_id
+    // return size() if there is no such position
+    uint32_t seq_cell_min(llama_seq_id seq_id, llama_pos p0) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        const auto it = sp.lower_bound({ p0, 0 });
+
+        return it == sp.end() ? size() : it->second;
+    }
+
     // the minimum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_min(llama_seq_id seq_id) const {

@@ -455,10 +455,17 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        // a removed tail can wrap around the end of a SWA cache, then its first cell is not the lowest one
+        const bool is_tail = n_swa > 0 && p1 == std::numeric_limits<llama_pos>::max();
+        const uint32_t idx_tail = is_tail ? cells.seq_cell_min(seq_id, p0) : cells.size();
+
         const uint32_t new_head = cells.seq_rm(seq_id, p0, p1);
 
-        // If we freed up a slot, set head to it so searching can start there.
-        if (new_head != cells.size() && new_head < head) {
+        if (idx_tail != cells.size() && cells.is_empty(idx_tail)) {
+            // continue at the cell of the first removed position, as if the tail was never stored
+            head = idx_tail;
+        } else if (new_head != cells.size() && new_head < head) {
+            // If we freed up a slot, set head to it so searching can start there.
             head = new_head;
         }
     } else {
