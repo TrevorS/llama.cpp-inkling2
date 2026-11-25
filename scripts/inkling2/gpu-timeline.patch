@@ -1,0 +1,18 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e12c55a39..e79b87cde 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -782,6 +782,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+ 
+         ggml_metal_op_free(ctx_op);
+ 
++        if (getenv("X_GPUT")) { // XTMP log the GPU time of each command buffer
++            const int n_nodes_cb = idx_end - idx_start;
++            const double t_enc = [[NSProcessInfo processInfo] systemUptime];
++            [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++                fprintf(stderr, "XGPU cb %d nodes %d enc_end %.3f gpu %.3f-%.3f (%.3f ms)\n", cb_idx, n_nodes_cb, t_enc*1e3, cb.GPUStartTime*1e3, cb.GPUEndTime*1e3, (cb.GPUEndTime - cb.GPUStartTime)*1e3);
++            }];
++        }
+         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+             [cmd_buf commit];
+         }

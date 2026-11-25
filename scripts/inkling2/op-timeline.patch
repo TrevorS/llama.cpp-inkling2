@@ -1,0 +1,375 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index f649957bf..94a983bda 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -471,6 +471,8 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
+     }
+ }
+ 
++static int ggml_metal_x_graph = 0; // XTMP
++
+ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+     if (ctx->has_error) {
+         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
+@@ -490,6 +492,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+     // keep the memory wired
+     ggml_metal_device_rsets_keep_alive(ctx->dev);
+ 
++    if (getenv("X_OPT")) { // XTMP op timeline probe: number the graphs, pair CPU ns with GPU ticks
++        uint64_t c = 0, g = 0;
++        ggml_metal_device_sample_timestamps(ctx->dev, &c, &g);
++        fprintf(stderr, "XOPCAL\t%d\t%llu\t%llu\t%llu\n", ++ggml_metal_x_graph, (unsigned long long) clock_gettime_nsec_np(CLOCK_UPTIME_RAW), (unsigned long long) c, (unsigned long long) g);
++    }
++
+     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
+     // the first n_main nodes are encoded and submitted for processing directly by the calling thread
+     // while these nodes are processing, we start n_cb threads to enqueue the rest of the nodes
+@@ -829,6 +837,15 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+             idx += res - 1;
+         }
+ 
++        struct ggml_metal_op_timing * x_t = ggml_metal_op_take_timing(ctx_op); // XTMP
++        if (x_t) {
++            const int x_g = ggml_metal_x_graph;
++            [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++                (void) cb;
++                ggml_metal_op_timing_print(x_t, x_g, cb_idx);
++            }];
++        }
++
+         ggml_metal_op_free(ctx_op);
+ 
+         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 591c778de..bab2e9ee1 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -75,6 +75,14 @@ typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
+ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
+ void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
+ 
++// XTMP op timeline probe: GPU timestamps at the start and end of an encoder
++typedef void * ggml_metal_sample_buf_t;
++ggml_metal_sample_buf_t ggml_metal_sample_buf_init(ggml_metal_device_t dev, int n);
++void ggml_metal_sample_buf_free(ggml_metal_sample_buf_t sbuf);
++int  ggml_metal_sample_buf_read(ggml_metal_sample_buf_t sbuf, int n, uint64_t * out);
++ggml_metal_encoder_t ggml_metal_encoder_init_sampled(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent, ggml_metal_sample_buf_t sbuf, int i0, int i1);
++void ggml_metal_device_sample_timestamps(ggml_metal_device_t dev, uint64_t * cpu, uint64_t * gpu);
++
+ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name);
+ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index b632345ab..187eb561d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -855,6 +855,43 @@ void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
+     free(encoder);
+ }
+ 
++void ggml_metal_sample_buf_free(ggml_metal_sample_buf_t sbuf) {
++    [(id<MTLCounterSampleBuffer>) sbuf release];
++}
++
++int ggml_metal_sample_buf_read(ggml_metal_sample_buf_t sbuf, int n, uint64_t * out) {
++    int m = 0;
++    @autoreleasepool {
++        NSData * data = [(id<MTLCounterSampleBuffer>) sbuf resolveCounterRange:NSMakeRange(0, n)];
++        if (data) {
++            const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) data.bytes;
++            m = (int) (data.length / sizeof(MTLCounterResultTimestamp));
++            for (int i = 0; i < m; ++i) {
++                out[i] = ts[i].timestamp;
++            }
++        }
++    }
++    return m;
++}
++
++ggml_metal_encoder_t ggml_metal_encoder_init_sampled(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent, ggml_metal_sample_buf_t sbuf, int i0, int i1) {
++    ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
++
++    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++
++    MTLComputePassDescriptor * desc = [MTLComputePassDescriptor computePassDescriptor];
++    desc.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
++    desc.sampleBufferAttachments[0].sampleBuffer              = (id<MTLCounterSampleBuffer>) sbuf;
++    desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = i0;
++    desc.sampleBufferAttachments[0].endOfEncoderSampleIndex   = i1;
++
++    res->obj = [cmd_buf computeCommandEncoderWithDescriptor:desc];
++    [res->obj retain];
++
++    return res;
++}
++
++
+ void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name) {
+     @autoreleasepool {
+         [encoder->obj pushDebugGroup:[NSString stringWithCString:name encoding:NSUTF8StringEncoding]];
+@@ -2787,3 +2824,44 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
+ 
+     return res;
+ }
++
++ggml_metal_sample_buf_t ggml_metal_sample_buf_init(ggml_metal_device_t dev, int n) {
++    id<MTLDevice> device = dev->mtl_device;
++    if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
++        GGML_LOG_ERROR("%s: no stage boundary counter sampling\n", __func__);
++        return NULL;
++    }
++
++    id<MTLCounterSet> ts = nil;
++    for (id<MTLCounterSet> cs in device.counterSets) {
++        if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) {
++            ts = cs;
++        }
++    }
++    if (ts == nil) {
++        GGML_LOG_ERROR("%s: no timestamp counter set\n", __func__);
++        return NULL;
++    }
++
++    MTLCounterSampleBufferDescriptor * desc = [[MTLCounterSampleBufferDescriptor alloc] init];
++    desc.counterSet  = ts;
++    desc.storageMode = MTLStorageModeShared;
++    desc.sampleCount = n;
++
++    NSError * err = nil;
++    id<MTLCounterSampleBuffer> sb = [device newCounterSampleBufferWithDescriptor:desc error:&err];
++    [desc release];
++    if (sb == nil) {
++        GGML_LOG_ERROR("%s: %s\n", __func__, [[err description] UTF8String]);
++        return NULL;
++    }
++
++    return (void *) sb;
++}
++
++void ggml_metal_device_sample_timestamps(ggml_metal_device_t dev, uint64_t * cpu, uint64_t * gpu) {
++    MTLTimestamp c = 0, g = 0;
++    [dev->mtl_device sampleTimestamps:&c gpuTimestamp:&g];
++    *cpu = c;
++    *gpu = g;
++}
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index d28e995a8..b0d57478c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <limits>
+ #include <cmath>
++#include <string>
+ 
+ // threadgroups needed to fill the GPU
+ // TODO: dedup
+@@ -43,6 +44,7 @@ struct ggml_metal_op {
+         bool use_capture,
+         int  debug_graph) {
+         this->dev             = dev;
++        this->cmd_buf         = cmd_buf;
+         this->lib             = ggml_metal_device_get_library(dev);
+         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
+@@ -64,14 +66,37 @@ struct ggml_metal_op {
+                 idxs.push_back(i);
+             }
+         }
++
++        x_opt = getenv("X_OPT") != nullptr;
+     }
+ 
+     ~ggml_metal_op() {
+         ggml_metal_encoder_end_encoding(this->enc);
+         ggml_metal_encoder_free(this->enc);
+         ggml_mem_ranges_free(this->mem_ranges);
++        for (auto * sb : sbufs) {
++            ggml_metal_sample_buf_free(sb);
++        }
+     }
+ 
++    struct rec {
++        int    idx;
++        int    n_fuse;
++        int    ne0;
++        int    ne1;
++        double bytes;
++        char   op[32];
++        char   name[64];
++    };
++
++    // a sample buffer holds at most 32 KB, so 2048 ops get 4096 timestamps each
++    static constexpr int x_ops_per_sbuf = 2048;
++
++    ggml_metal_cmd_buf_t                 cmd_buf;
++    bool                                 x_opt = false;
++    std::vector<ggml_metal_sample_buf_t> sbufs;
++    std::vector<rec>                     recs;
++
+     int n_nodes() const {
+         return idxs.size();
+     }
+@@ -543,12 +568,146 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+     return n_fuse;
+ }
+ 
++// XTMP bytes one op group reads and writes: inputs made outside the group plus the last output
++// MUL_MAT_ID reads only the used experts, GET_ROWS only the gathered rows (estimates)
++static double ggml_metal_op_x_bytes(ggml_metal_op_t ctx, int idx, int n) {
++    std::vector<const ggml_tensor *> group;
++    for (int i = 0; i < n; ++i) {
++        group.push_back(ctx->node(idx + i));
++    }
++    auto in_group = [&](const ggml_tensor * t) {
++        for (const ggml_tensor * g : group) {
++            if (t == g || t->view_src == g) {
++                return true;
++            }
++        }
++        return false;
++    };
++
++    double res = 0;
++    std::vector<const ggml_tensor *> seen;
++    for (const ggml_tensor * node : group) {
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            const ggml_tensor * s = node->src[j];
++            if (!s || in_group(s) || std::find(seen.begin(), seen.end(), s) != seen.end() || (node->op == GGML_OP_SET_ROWS && j == 2)) {
++                continue;
++            }
++            seen.push_back(s);
++            double b = ggml_nbytes(s);
++            if (node->op == GGML_OP_MUL_MAT_ID && j == 0 && node->src[2]) {
++                b *= std::min(1.0, (double) ggml_nelements(node->src[2]) / s->ne[2]);
++            } else if (node->op == GGML_OP_GET_ROWS && j == 0) {
++                b = (double) ggml_row_size(s->type, s->ne[0]) * ggml_nelements(node->src[1]);
++            }
++            res += b;
++        }
++    }
++    const ggml_tensor * last = group.back();
++    if (last->op == GGML_OP_SET_ROWS) {
++        res += (double) ggml_row_size(last->type, last->src[0]->ne[0]) * ggml_nrows(last->src[0]);
++    } else {
++        res += ggml_nbytes(last);
++    }
++
++    return res;
++}
++
++static bool ggml_metal_op_x_timed(const ggml_tensor * node) {
++    switch (node->op) {
++        case GGML_OP_NONE:
++        case GGML_OP_RESHAPE:
++        case GGML_OP_VIEW:
++        case GGML_OP_TRANSPOSE:
++        case GGML_OP_PERMUTE:
++            return false;
++        default:
++            return !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE);
++    }
++}
++
++struct ggml_metal_op_timing {
++    std::vector<ggml_metal_sample_buf_t> sbufs;
++    std::vector<ggml_metal_op::rec> recs;
++};
++
++struct ggml_metal_op_timing * ggml_metal_op_take_timing(ggml_metal_op_t ctx) {
++    if (ctx->sbufs.empty()) {
++        return nullptr;
++    }
++    auto * t = new ggml_metal_op_timing { std::move(ctx->sbufs), std::move(ctx->recs) };
++    ctx->sbufs.clear();
++    return t;
++}
++
++void ggml_metal_op_timing_print(struct ggml_metal_op_timing * t, int graph, int cb) {
++    const int per = ggml_metal_op::x_ops_per_sbuf;
++    std::vector<uint64_t> ts(2*per*t->sbufs.size());
++    int m = 0;
++    for (size_t i = 0; i < t->sbufs.size(); ++i) {
++        const int n = 2*std::min(per, (int) t->recs.size() - (int) i*per);
++        const int got = ggml_metal_sample_buf_read(t->sbufs[i], n, ts.data() + 2*per*i);
++        m = got == n ? 2*per*(int) i + n : m;
++        if (got != n) {
++            break;
++        }
++    }
++    std::string out;
++    char line[256];
++    for (size_t k = 0; k < t->recs.size() && (int) (2*k + 1) < m; ++k) {
++        const auto & r = t->recs[k];
++        snprintf(line, sizeof(line), "XOP\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t%.0f\t%llu\t%llu\n", graph, cb, r.idx, r.n_fuse, r.op, r.name, r.ne0, r.ne1, r.bytes,
++                (unsigned long long) ts[2*k], (unsigned long long) ts[2*k + 1]);
++        out += line;
++    }
++    fputs(out.c_str(), stderr);
++    for (auto * sb : t->sbufs) {
++        ggml_metal_sample_buf_free(sb);
++    }
++    delete t;
++}
++
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+     if (ctx->use_capture) {
+         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
+     }
+ 
++    // XTMP one encoder per op, so the stage boundary timestamps time each op
++    bool timed = ctx->x_opt && ggml_metal_op_x_timed(ctx->node(idx));
++    if (timed) {
++        const int k = (int) ctx->recs.size() % ggml_metal_op::x_ops_per_sbuf;
++        if (k == 0) {
++            ggml_metal_sample_buf_t sb = ggml_metal_sample_buf_init(ctx->dev, 2*ggml_metal_op::x_ops_per_sbuf);
++            if (sb) {
++                ctx->sbufs.push_back(sb);
++            } else {
++                ctx->x_opt = timed = false;
++            }
++        }
++    }
++    if (timed) {
++        ggml_metal_encoder_end_encoding(ctx->enc);
++        ggml_metal_encoder_free(ctx->enc);
++        const int k = (int) ctx->recs.size() % ggml_metal_op::x_ops_per_sbuf;
++        ctx->enc = ggml_metal_encoder_init_sampled(ctx->cmd_buf, ctx->use_concurrency, ctx->sbufs.back(), 2*k, 2*k + 1);
++        if (ctx->mem_ranges) {
++            ggml_mem_ranges_reset(ctx->mem_ranges);
++        }
++    }
++
+     int res = ggml_metal_op_encode_impl(ctx, idx);
++
++    if (timed) {
++        const ggml_tensor * node = ctx->node(idx);
++        ggml_metal_op::rec r = {};
++        r.idx    = idx;
++        r.n_fuse = res;
++        r.ne0    = (int) node->ne[0];
++        r.ne1    = (int) node->ne[1];
++        r.bytes  = ggml_metal_op_x_bytes(ctx, idx, res);
++        snprintf(r.op,   sizeof(r.op),   "%s", ggml_op_desc(node));
++        snprintf(r.name, sizeof(r.name), "%s", node->name[0] ? node->name : "-");
++        ctx->recs.push_back(r);
++    }
+     if (idx + res > ctx->n_nodes()) {
+         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
+                 "https://github.com/ggml-org/llama.cpp/pull/14849");
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index bea249fe9..41e78a579 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -27,6 +27,11 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+ 
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
+ 
++// XTMP op timeline probe (X_OPT=1): take the op records of an encoded command buffer, print them when it completes
++struct ggml_metal_op_timing;
++struct ggml_metal_op_timing * ggml_metal_op_take_timing(ggml_metal_op_t ctx);
++void ggml_metal_op_timing_print(struct ggml_metal_op_timing * t, int graph, int cb);
++
+ //
+ // available ops:
+ //

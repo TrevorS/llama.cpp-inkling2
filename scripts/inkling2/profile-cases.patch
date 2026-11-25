@@ -1,0 +1,25 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ecbbe30ec..92ab44cab 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -14302,6 +14302,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 2048, 16, 5, 4 }));
+     test_cases.emplace_back(new test_cumsum(GGML_TYPE_F32, { 20000, 10, 4, 1 }));
+ 
++    for (int n : {1, 8, 16}) { // XTMP inkling profile
++        for (auto mk : std::vector<std::array<int,2>>{{3072, 2304}, {1024, 2304}, {2304, 3072}, {201024, 2304}, {24, 2304}, {64, 4608}, {384, 2304}, {32, 2304}}) { // XTMP
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1})); // XTMP
++        } // XTMP
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 128, n, 2304, {1, 1}, {1, 1})); // XTMP
++        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_BF16}) { // XTMP
++            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304)); // XTMP
++            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152)); // XTMP
++        } // XTMP
++        for (int kv : {1024, 32768, 131072}) { // XTMP
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, n, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16)); // XTMP
++        } // XTMP
++    } // XTMP
++
+     for (int bs : {1, 2, 3, 4, 5, 8, 512}) {
+         for (ggml_type type_a : all_types) {
+             for (ggml_type type_b : {GGML_TYPE_F32}) {
