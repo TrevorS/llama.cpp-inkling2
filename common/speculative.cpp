@@ -1425,6 +1425,11 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         LOG_INF("%s: - sample_from_anchor=%s, has_markov_context=%s\n", __func__,
                 sample_from_anchor ? "true" : "false", has_markov_context ? "true" : "false");
 
+        // without probabilistic drafts the graph never draws, the argmax chain is enough
+        if (has_markov_context && !this->params.probabilistic) {
+            llama_set_draft_draws(this->params.ctx_dft, false);
+        }
+
         // anchor-first DSpark yields a full block_size draft tokens
         // the context state is read back from h_nextn at every injected row
         init({

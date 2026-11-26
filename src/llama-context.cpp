@@ -207,6 +207,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.draft_draws             = true;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
 
@@ -1422,6 +1423,15 @@ void llama_context::set_embeddings(bool value) {
     }
 
     cparams.embeddings = value;
+}
+
+void llama_context::set_draft_draws(bool value) {
+    if (cparams.draft_draws != value) {
+        // the draws change the graph shape
+        sched_need_reserve = true;
+    }
+
+    cparams.draft_draws = value;
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -4715,6 +4725,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_draft_draws(llama_context * ctx, bool value) {
+    ctx->set_draft_draws(value);
 }
 
 bool llama_set_embeddings_nextn_dev(llama_context * ctx, bool value) {

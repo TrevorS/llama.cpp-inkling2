@@ -282,6 +282,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
                 i*rnn_state->nb[1] + off*ggml_element_size(rnn_state)));
     };
 
+    // drafts that are always greedy take only the argmax chain (see llama_set_draft_draws)
+    const bool draws = rnn_state && g.cparams.draft_draws;
+
     ggml_tensor * f_rnn     = nullptr; // [n_embd, n_blocks]
     ggml_tensor * inv_temp  = nullptr; // [1, n_blocks]
     ggml_tensor * is_greedy = nullptr; // [1, n_blocks], 1 when inv_temp is 0
@@ -341,7 +344,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
         if (has_conf) {
             cat_conf = ggml_sigmoid(ctx0, ggml_view_2d(ctx0, base, 1, n_blocks, base_stride, 0));
         }
-        if (rnn_state) {
+        if (draws) {
             cat_draw = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_blocks), 0.0f);
         }
     }
@@ -418,7 +421,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
         }
 
-        if (rnn_state) {
+        if (draws) {
             ggml_tensor * packed = draw(col, i, prev);
             cat_draw = cat_draw ? ggml_concat(ctx0, cat_draw, packed, 1) : packed;
         } else if (i + 1 < block_drafts) {

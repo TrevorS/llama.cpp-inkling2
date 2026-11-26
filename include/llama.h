@@ -1187,6 +1187,10 @@ extern "C" {
     // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
     LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+    // Set whether a DSpark draft graph draws its tokens at the sampling temperature (default: true)
+    // With false the graph only takes the argmax chain, for drafts that are always greedy
+    LLAMA_API void llama_set_draft_draws(struct llama_context * ctx, bool value);
+
     // Select which appended NextN block the DECODER_MTP graph runs (offset past
     // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
     // chain multiple trained NextN heads. Default 0 (first head).
