@@ -3273,6 +3273,13 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        // a draft that shares the target's lm head reads it on every draft: a Q8_0 copy halves that for a 16-bit head
+        // (the draft logits round differently; the output does not change, the target verifies every token)
+        const char * env_head = getenv("LLAMA_DRAFT_HEAD_Q8");
+        if (!(env_head && atoi(env_head) == 0) && llama_model_copy_lm_head(model_dft, model_tgt, GGML_TYPE_Q8_0)) {
+            LOG_INF("%s: the draft reads a Q8_0 copy of the target's lm head\n", __func__);
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);

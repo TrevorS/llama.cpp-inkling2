@@ -599,6 +599,10 @@ extern "C" {
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
+
+    // Give a draft model that shares the lm head of model_other its own copy of it in type (e.g. GGML_TYPE_Q8_0), cut to its vocabulary
+    // Returns false and changes nothing when the model has its own head or the copy cannot be made
+    LLAMA_API bool llama_model_copy_lm_head(struct llama_model * model, const struct llama_model * model_other, enum ggml_type type);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);

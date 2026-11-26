@@ -1171,6 +1171,12 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
+    // helper: hold the BF16 expert weights that are exact in MXFP8 as MXFP8 (half the bytes, the same values)
+    void load_tensors_mxfp8();
+
+    // see llama_model_copy_lm_head
+    bool copy_lm_head(const llama_model & other, ggml_type type);
+
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
