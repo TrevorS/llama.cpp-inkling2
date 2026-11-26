@@ -817,6 +817,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
         /*.nb3  =*/ pnb3,
         /*.offs =*/ offs,
         /*.o1   =*/ { 0 },
+        /*.nch  =*/ 1,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_bin_one(lib, GGML_OP_ADD);
@@ -4549,6 +4550,7 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         /*.nb3  =*/ nb3,
         /*.offs =*/ 0,
         /*.o1   =*/ { bid_src1.offs },
+        /*.nch  =*/ 1,
     };
 
     // c[0] = add(a,    b[0])
@@ -4593,6 +4595,20 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         args.ne0  = ne0/4;
     }
 
+    int nth = MIN(256, args.ne0);
+
+    if (!pipeline.cnt) {
+        const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+        nth = 1;
+        while (2*nth < args.ne0 && nth < nth_max) {
+            nth *= 2;
+        }
+
+        // up to 8 elements per thread: a long row would run on one threadgroup otherwise
+        args.nch = (args.ne0 + 8*nth - 1)/(8*nth);
+    }
+
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
@@ -4600,19 +4616,9 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
 
     if (pipeline.cnt) {
-        const int nth = MIN(256, args.ne0);
-
         ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, ggml_nrows(op), 1, nth, 1, 1);
     } else {
-        const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-
-        int nth = 1;
-
-        while (2*nth < args.ne0 && nth < nth_max) {
-            nth *= 2;
-        }
-
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01*args.nch, ne02, ne03, nth, 1, 1);
     }
 
     return n_fuse;

@@ -81,9 +81,15 @@ kernel void kernel_bin_fuse_impl(
             dst_row[i0] = res;
         }
     } else {
+        const int nch = max(1, args.nch);
+
         const int i03 = tgpig.z;
         const int i02 = tgpig.y;
-        const int i01 = tgpig.x;
+        const int i01 = tgpig.x/nch;
+
+        // a long row is split over nch threadgroups
+        const int i0s = (tgpig.x%nch)*ntg.x + tpitg.x;
+        const int i0d = nch*ntg.x;
 
         if (i01 >= args.ne01) {
             return;
@@ -99,7 +105,7 @@ kernel void kernel_bin_fuse_impl(
         if (FC_F == 1) {
             device const T1 * src1_ptr = (device const T1 *) (src1 + args.o1[0] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
 
-            for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+            for (int i0 = i0s; i0 < args.ne0; i0 += i0d) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
 
                 if (FC_OP == 0) {
@@ -124,7 +130,7 @@ kernel void kernel_bin_fuse_impl(
                 src1_ptr[j] = (device const T1 *) (src1 + args.o1[j] + i13*args.nb13 + i12*args.nb12 + i11*args.nb11);
             }
 
-            for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+            for (int i0 = i0s; i0 < args.ne0; i0 += i0d) {
                 const int i10 = FC_CB ? i0%args.ne10 : i0;
 
                 T res = src0_ptr[i0];

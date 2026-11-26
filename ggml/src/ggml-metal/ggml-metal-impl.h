@@ -280,6 +280,7 @@ typedef struct {
     uint64_t nb3;
     uint64_t offs;
     uint64_t o1[8];
+    int32_t  nch; // threadgroups per row (0 or 1: one)
 } ggml_metal_kargs_bin;
 
 typedef struct {
