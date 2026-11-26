@@ -1,6 +1,6 @@
 # llama.cpp, Inkling 2 fork
 
-This branch is upstream llama.cpp ([`9c003a97a`](https://github.com/ggml-org/llama.cpp/commit/9c003a97a)) plus 12 commits that make Inkling 2 Mini fast on Apple Metal. Speculative output stays exact: with speculation on, the text is the same as plain decode, and a batch of 1-8 rows gives the same logits as a batch of one. The tools, the checks and the review notes are in [`scripts/inkling2`](scripts/inkling2/README.md).
+This branch is upstream llama.cpp ([`9c003a97a`](https://github.com/ggml-org/llama.cpp/commit/9c003a97a)) plus 17 commits that make Inkling 2 Mini fast on Apple Metal. Speculative output stays exact: with speculation on, the text is the same as plain decode, and a batch of 1-8 rows gives the same logits as a batch of one. The tools, the checks and the review notes are in [`scripts/inkling2`](scripts/inkling2/README.md).
 
 ## Changes from upstream
 
@@ -11,8 +11,11 @@ This branch is upstream llama.cpp ([`9c003a97a`](https://github.com/ggml-org/lla
 - `metal`: Inkling 2 kernels and fusions. Depth mix, short conv, loop controllers, concat + norm and other chains run as fused kernels: 2105 dispatches per decode step instead of 3541. NVFP4 mat-vec reads whole words. The NVFP4 MoE mat-mul keeps `half` operands (upstream uses `bfloat`, mean KLD 0.0016). Up to 8 queries, flash attention uses the dense mask, so each row is equal to a batch of one. `GGML_METAL_N_CB` overrides the number of command buffers.
 - `metal`: binary ops split a long row over threadgroups. A 200k-wide add of the draft ran on one threadgroup (0.3 ms each).
 - `inkling2`: keep the depth mix layout and the node order that the Metal fusions need.
+- `ggml`: the MXFP8 type (E4M3 values, one E8M0 scale per 32), from the open upstream #26157 with 128-value blocks and type 44 (fork only, never written to a file).
+- `metal`: MXFP8 mat-vec and mat-mul with the sums of the BF16 kernels, so MXFP8 weights that come from BF16 give the same results bitwise.
+- `llama`: weights converted at load, the model files stay as published. BF16 expert weights that are exact in MXFP8 are held as MXFP8, outside the mapped file (Inkling 2 layers 20-23: 7.6 GiB -> 3.9 GiB; `LLAMA_MXFP8=0` turns it off). A draft that shares the target's lm head gets a Q8_0 copy of it (`llama_model_copy_lm_head`; `LLAMA_DRAFT_HEAD_Q8=0` turns it off).
 - `dspark`: greedy drafts take only the argmax chain (`llama_set_draft_draws`). Before, each draft step built the sampled draws too: three top-k over the whole vocabulary that greedy drafts never read.
-- `scripts/inkling2`: serving (`serve.sh`: DSpark draft k=3 plus n-gram drafts by default), exactness checks, KLD, benches, sweeps and profilers. The draft runs with one CPU thread (12 threads cost 1.7 ms per draft to start) and its own Q8_0 lm head (`draft-head.py`; the shared BF16 head of the target is twice the bytes).
+- `scripts/inkling2`: serving (`serve.sh`: DSpark draft k=3 plus n-gram drafts by default), exactness checks, KLD, benches, sweeps and profilers. The draft runs with one CPU thread (12 threads cost 1.7 ms per draft to start). Prompts are read in ubatches of 2048 tokens (12% faster than 512 on long prompts, mean KLD 0.0004).
 
 Taken from upstream instead of the old fork: the DSpark/DFlash draft code, the chunked command buffers (2.7% faster decode than our 8 buffers), the NVFP4 type and the indexed bias in flash attention.
 
@@ -22,27 +25,27 @@ Taken from upstream instead of the old fork: the DSpark/DFlash draft code, the c
 |---|---|---|
 | pp512, depth 0 / 8k / 32k (tok/s) | 593 / 360 / 195 | 900 / 742 / 581 |
 | tg128, depth 0 / 8k / 32k (tok/s) | 37.0 / 34.8 / 31.9 | 47.6 / 45.3 / 42.2 |
+| tg128 / pp4 with the MXFP8 experts (tok/s) | | 48.0 / 124.6 (BF16: 47.3 / 121.9) |
+| pp4096, ubatch 512 / 2048 (tok/s) | | 787 / 879 |
 
 Server decode with the default n-gram + k3 speculation (`spec-sweep.sh`, tok/s, the text is the same as with speculation off):
 
 | | short prompts | edit prompts | replay, 3 turns |
 |---|---|---|---|
-| speculation off | 46.9 | 45.8 | 44.9 |
-| n-gram + k3 | 64.3 | 111.9 | 67.9 |
+| speculation off | 47.7 | 46.5 | 45.6 |
+| n-gram + k3 | 65.0 | 113.3 | 68.6 |
 
-Checks: decode logits bitwise equal to the old fork and to the previous rebase, prefill KLD 0, `exact-matrix.sh` 27/27, `test-backend-ops` 20423/20423, `identity.sh` equal to plain decode.
+Checks: decode logits bitwise equal to the old fork, to the previous rebase and with or without MXFP8, `exact-matrix.sh` 27/27, `test-backend-ops` 20663/20663, `identity.sh` equal to plain decode. The model takes 3.7 GiB less memory with the MXFP8 experts (server RSS 22.75 GiB, was 26.4).
 
 ## Next
 
-A speculative step (k3, short prompts) is now about 39 ms: about 33 ms to verify 4 tokens and about 6 ms to draft.
+A speculative step (k3, short prompts) is about 39 ms: about 32 ms to verify 4 tokens and about 5 ms to draft.
 
-1. The 4-token verify step. With duplicate expert routes made free, pp4 goes up only 8% (pp8 20%), so a MoE kernel that decodes each expert weight once for all its tokens can get part of that.
-2. Store the experts of layers 20-23 as MXFP8. The BF16 weights are exact in E4M3 x E8M0 (4096 of 4096 sampled blocks), so the change is lossless and halves their bytes.
-3. Fewer barriers. A decode step has 1701 barriers in 2105 dispatches, about 2 us each (16% of decode). Each norm that moves into the next mat-vec removes one.
-4. Tune the BF16 K/V and NVFP4 down projection mat-vecs (341 and 349 GB/s).
-5. The draft: 3 layers, the Q8_0 head (about 1 ms) and the feature inject graph each step; the DFlash2 drafter (upstream #33049).
+1. Fewer barriers. A decode step has 1701 barriers in 2105 dispatches, about 2 us each. With every norm-to-mat-vec barrier dropped (a timing test with wrong output) decode is 4.2% faster and pp4 2%; a norm folded into the BF16 and F32 mat-vecs has to redo the norm sum in each threadgroup, so expect about half.
+2. Tune the BF16 K/V and NVFP4 down projection mat-vecs (341 and 349 GB/s).
+3. The draft: the DFlash2 drafter (upstream #33049).
 
-Measured and dropped: experts read once through the cache (slower: one threadgroup does the tokens one after another), more threadgroups for the depth mix kernel (its own work is 1% of decode, the rest is dispatch cost), a Q4_0 draft head and a Q8_0 `markov_w2` (no gain).
+Measured and dropped: experts read once through the cache (slower), a multi-token NVFP4 MoE mat-vec that decodes each weight once for all tokens of an expert (17-25% slower: register pressure), more threadgroups for the depth mix kernel (1% of decode), a Q4_0 draft head and a Q8_0 `markov_w2`, backend sampling for the target and 2 command buffers (no gain).
 
 ---
 

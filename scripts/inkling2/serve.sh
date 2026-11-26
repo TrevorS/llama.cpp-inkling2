@@ -4,6 +4,7 @@
 # 4 slots share one 131k KV pool (NP=1 for one slot); drafts run only while one slot generates.
 # DRAFT=<file> sets the draft model; the default is Unsloth's mainline-format DSpark file (it gets a Q8_0 copy of the target's lm head at load).
 # n-gram drafts of up to 7 tokens cover text the reply repeats, as in file edits; batches stay within 8 tokens. NGRAM=0 turns them off.
+# prompts are read in ubatches of 2048 tokens (UB): 12% faster than 512 on long prompts, mean KLD 0.0004 against 512 (noise floor ~0.0013).
 M=${INKLING_DIR:-$HOME/models/Inkling-2-Mini-GGUF}
 spec=()
 if [[ ${SPEC:-1} == 1 ]]; then
@@ -19,6 +20,7 @@ exec ${0:A:h:h:h}/build/bin/llama-server \
   $spec \
   --alias inkling-2-mini \
   -c ${CTX:-131072} -np ${NP:-4} -kvu -fa on --jinja \
+  -ub ${UB:-2048} \
   -ctxcp 32 -cms 1024 \
   -n 32768 \
   --metrics \
