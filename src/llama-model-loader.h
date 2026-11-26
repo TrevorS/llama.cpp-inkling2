@@ -145,10 +145,11 @@ struct llama_model_loader {
         }
     };
 
-    // lazy tensors need dedicated context
+    // lazy tensors and tensors converted at load need dedicated contexts
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool conv = false; // converted at load: not mapped from the file
     };
 
     struct ctx_key_comparator {
@@ -156,11 +157,21 @@ struct llama_model_loader {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }
+            if (lhs.conv != rhs.conv) {
+                return lhs.conv < rhs.conv;
+            }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }
     };
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
+
+    // data of the tensors converted at load, uploaded by load_all_data
+    // in CPU buffers: they use vm_allocate on Apple platforms, so freeing one returns its pages to the OS right away
+    std::unordered_map<std::string, ggml_backend_buffer_ptr> conv_data;
+
+    // BF16 expert weights that are exact in MXFP8: true and the MXFP8 data in out (see create_tensor)
+    bool convert_mxfp8(const llama_tensor_weight & w, ggml_backend_buffer_ptr & out);
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

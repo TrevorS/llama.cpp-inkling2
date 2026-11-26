@@ -2215,7 +2215,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // a context of tensors converted at load holds data that is not in the file
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !ctx_key.conv) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
@@ -2337,7 +2338,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
-    load_tensors_mxfp8();
 
     return true;
 }
@@ -2416,125 +2416,6 @@ bool llama_model_base::copy_lm_head(const llama_model & other, ggml_type type) {
             ggml_type_name(type), (long long) n_embd, (long long) n_rows, data.size()/1024.0/1024.0);
 
     return true;
-}
-
-// BF16 weights that come from MXFP8 (E4M3 values with one power-of-two scale per 32) are held as MXFP8 when the device multiplies it:
-// the values do not change, the weights take half the bytes. LLAMA_MXFP8=0 turns it off
-void llama_model_base::load_tensors_mxfp8() {
-    const char * env = getenv("LLAMA_MXFP8");
-    if (env && atoi(env) == 0) {
-        return;
-    }
-
-    size_t n_saved = 0;
-    int    n_conv  = 0;
-
-    // layers can share a tensor (looped models): one copy each
-    std::map<ggml_tensor *, ggml_tensor *> done;
-
-    for (auto & layer : layers) {
-        for (ggml_tensor ** pw : { &layer.ffn_gate_up_exps, &layer.ffn_up_exps, &layer.ffn_gate_exps, &layer.ffn_down_exps }) {
-            ggml_tensor * w = *pw;
-            if (auto it = done.find(w); it != done.end()) {
-                *pw = it->second;
-                continue;
-            }
-            if (!w || w->type != GGML_TYPE_BF16 || !w->buffer || w->ne[0] % ggml_blck_size(GGML_TYPE_MXFP8) != 0 || !ggml_is_contiguous(w)) {
-                continue;
-            }
-
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->buffer);
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                continue;
-            }
-
-            ggml_init_params params = {
-                /*.mem_size   =*/ 4*ggml_tensor_overhead(),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context_ptr ctx { ggml_init(params) };
-
-            ggml_tensor * q = ggml_new_tensor(ctx.get(), GGML_TYPE_MXFP8, GGML_MAX_DIMS, w->ne);
-            ggml_set_name(q, w->name);
-
-            // the device must multiply MXFP8 experts
-            {
-                ggml_tensor * b   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, w->ne[0], 1, 1);
-                ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, 1);
-                if (!ggml_backend_dev_supports_op(dev, ggml_mul_mat_id(ctx.get(), q, b, ids))) {
-                    continue;
-                }
-            }
-
-            // convert one 2D slice (an expert) per thread, check that each value comes back the same
-            const int64_t ne0      = w->ne[0];
-            const int64_t n_rows   = ggml_nrows(w);
-            const int64_t n_slices = w->ne[2]*w->ne[3];
-            const int64_t n_rows_s = n_rows/n_slices;
-
-            std::vector<uint8_t> data(ggml_nbytes(q));
-            std::atomic<bool> exact { true };
-            std::atomic<int64_t> next { 0 };
-
-            auto work = [&]() {
-                std::vector<uint16_t> src(n_rows_s*ne0);
-                std::vector<float>    f32(n_rows_s*ne0);
-                std::vector<float>    back(n_rows_s*ne0);
-                for (int64_t s; exact && (s = next++) < n_slices; ) {
-                    ggml_backend_tensor_get(w, src.data(), s*w->nb[2], src.size()*sizeof(uint16_t));
-                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) src.data(), f32.data(), f32.size());
-                    uint8_t * dst = data.data() + s*q->nb[2];
-                    ggml_quantize_chunk(GGML_TYPE_MXFP8, f32.data(), dst, 0, n_rows_s, ne0, nullptr);
-                    ggml_get_type_traits(GGML_TYPE_MXFP8)->to_float(dst, back.data(), back.size());
-                    if (memcmp(f32.data(), back.data(), f32.size()*sizeof(float)) != 0) {
-                        exact = false;
-                    }
-                }
-            };
-
-            std::vector<std::thread> threads;
-            const int n_threads = (int) std::min<int64_t>(n_slices, std::max(1u, std::thread::hardware_concurrency()));
-            for (int i = 0; i < n_threads; ++i) {
-                threads.emplace_back(work);
-            }
-            for (auto & t : threads) {
-                t.join();
-            }
-
-            if (!exact) {
-                continue;
-            }
-
-            ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
-            if (!buffer) {
-                LLAMA_LOG_WARN("%s: unable to allocate the MXFP8 copy of %s, it stays BF16\n", __func__, w->name);
-                continue;
-            }
-            ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            ggml_backend_tensor_set(q, data.data(), 0, data.size());
-
-            for (auto & it : tensors_by_name) {
-                if (it.second == w) {
-                    it.second = q;
-                }
-            }
-            *pw = q;
-            done[w] = q;
-
-            n_saved += ggml_nbytes(w) - ggml_nbytes(q);
-            n_conv++;
-
-            std::vector<ggml_backend_buffer_ptr> buffers;
-            buffers.emplace_back(std::move(buffer));
-            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
-        }
-    }
-
-    if (n_conv > 0) {
-        LLAMA_LOG_INFO("%s: %d BF16 expert tensors are exact in MXFP8, held as MXFP8 (%.2f MiB less to read)\n", __func__, n_conv, n_saved/1024.0/1024.0);
-    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
