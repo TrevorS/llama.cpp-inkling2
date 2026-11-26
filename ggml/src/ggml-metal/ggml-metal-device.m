@@ -1536,6 +1536,11 @@ static bool ggml_metal_supports_mul_mat_op(
         return false;
     }
 
+    // the MXFP8 kernels take F32 activations and bfloat tiles
+    if (op->src[0]->type == GGML_TYPE_MXFP8 && op->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     if (op->src[1]->type != GGML_TYPE_F16) {
         return true;
     }
@@ -1562,7 +1567,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         }
 
         for (size_t i = 0, n = 3; i < n; ++i) {
-            if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
+            if (op->src[i] != NULL && (op->src[i]->type == GGML_TYPE_BF16 || op->src[i]->type == GGML_TYPE_MXFP8)) {
                 return false;
             }
         }
@@ -1997,7 +2002,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_GET_ROWS:
             return op->src[0]->type != GGML_TYPE_TQ1_0 &&
-                   op->src[0]->type != GGML_TYPE_F8_E4M3;
+                   op->src[0]->type != GGML_TYPE_F8_E4M3 &&
+                   op->src[0]->type != GGML_TYPE_MXFP8;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {

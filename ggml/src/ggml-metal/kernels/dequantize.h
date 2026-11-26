@@ -363,6 +363,23 @@ void dequantize_mxfp4(device const block_mxfp4 * xb, short il, thread type4x4 & 
     reg = (type4x4) reg_f;
 }
 
+// MXFP8: il selects 16 values, half il%2 of the 32-value sub-block il/2
+// the values and their E8M0 scales are exact in float, bfloat and the BF16 they come from
+template <typename type4x4>
+void dequantize_mxfp8(device const block_mxfp8 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * q = xb->qs[il/2] + 16*(il%2);
+
+    const float d = e8m0_to_fp32(xb->e[il/2]);
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; ++i) {
+        reg_f[i] = float4(e4m3_to_fp32(q[4*i + 0]), e4m3_to_fp32(q[4*i + 1]), e4m3_to_fp32(q[4*i + 2]), e4m3_to_fp32(q[4*i + 3])) * d;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4>
 void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 & reg) {
     device const uint8_t * q2 = (device const uint8_t *)xb->qs;

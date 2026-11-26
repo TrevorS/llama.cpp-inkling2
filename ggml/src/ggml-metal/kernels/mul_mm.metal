@@ -723,7 +723,9 @@ template [[host_name("kernel_mul_mm_tq2_0_f32_prec_f32")]]   kernel mul_mm_t ker
 
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_bf16_f32_prec_f32")]] kernel mul_mm_t kernel_mul_mm<float,  float,  bfloat4x4, 1, dequantize_bf16, bfloat, float>;
+template [[host_name("kernel_mul_mm_mxfp8_f32_prec_f32")]] kernel mul_mm_t kernel_mul_mm<float, float, block_mxfp8, 8, dequantize_mxfp8, float, float>;
 template [[host_name("kernel_mul_mm_bf16_f32")]]          kernel mul_mm_t kernel_mul_mm<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, float>;
+template [[host_name("kernel_mul_mm_mxfp8_f32")]]         kernel mul_mm_t kernel_mul_mm<bfloat, bfloat, block_mxfp8, 8, dequantize_mxfp8, float, float>;
 template [[host_name("kernel_mul_mm_bf16_bf16")]]         kernel mul_mm_t kernel_mul_mm<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, bfloat>;
 #endif
 template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half, half, block_q1_0,    8,     dequantize_q1_0,    float, float>;
@@ -788,6 +790,7 @@ template [[host_name("kernel_mul_mm_id_f32_f32")]]     kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_f16_f32")]]     kernel mul_mm_id kernel_mul_mm_id<half, half, half4x4,  1, dequantize_f16, half,  float>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_id_bf16_f32")]]    kernel mul_mm_id kernel_mul_mm_id<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, float>;
+template [[host_name("kernel_mul_mm_id_mxfp8_f32")]]   kernel mul_mm_id kernel_mul_mm_id<bfloat, bfloat, block_mxfp8, 8, dequantize_mxfp8, float, float>;
 #endif
 template [[host_name("kernel_mul_mm_id_q1_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q1_0, 8, dequantize_q1_0, float, float>;
 template [[host_name("kernel_mul_mm_id_q2_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q2_0, 4, dequantize_q2_0, float, float>;
@@ -850,6 +853,7 @@ template [[host_name("kernel_mul_mm_id_tq2_0_f32_prec_bf16")]]   kernel mul_mm_i
 #endif
 
 template [[host_name("kernel_mul_mm_id_f32_f32_prec_f32")]]    kernel mul_mm_id kernel_mul_mm_id<float, float, float4x4,      1,     dequantize_f32,     float, float>;
+template [[host_name("kernel_mul_mm_id_mxfp8_f32_prec_f32")]]  kernel mul_mm_id kernel_mul_mm_id<float, float, block_mxfp8,   8,     dequantize_mxfp8,   float, float>;
 template [[host_name("kernel_mul_mm_id_f16_f32_prec_f32")]]    kernel mul_mm_id kernel_mul_mm_id<float, float, half4x4,       1,     dequantize_f16,     half,  float>;
 template [[host_name("kernel_mul_mm_id_q1_0_f32_prec_f32")]]   kernel mul_mm_id kernel_mul_mm_id<float, float, block_q1_0,    8,     dequantize_q1_0,    float, float>;
 template [[host_name("kernel_mul_mm_id_q2_0_f32_prec_f32")]]   kernel mul_mm_id kernel_mul_mm_id<float, float, block_q2_0,    4,     dequantize_q2_0,    float, float>;

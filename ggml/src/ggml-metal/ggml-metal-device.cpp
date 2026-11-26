@@ -982,7 +982,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool prec_bf16 = props_dev->has_bfloat &&
         ggml_prec_get_src(op, 1) == GGML_PREC_BF16 && tsrc1 == GGML_TYPE_F32 &&
-        (has_tensor ? tsrc0 == GGML_TYPE_F32 : tsrc0 != GGML_TYPE_BF16);
+        (has_tensor ? tsrc0 == GGML_TYPE_F32 : tsrc0 != GGML_TYPE_BF16 && tsrc0 != GGML_TYPE_MXFP8);
 
     const bool prec_f32 = ggml_prec_get_src(op, 1) == GGML_PREC_F32 && tsrc1 == GGML_TYPE_F32;
 
@@ -1117,6 +1117,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                // the thread layout of the BF16 kernel, see kernel_mul_mv_mxfp8_f32_impl
+                nsg = std::min(4, (ne00 + 127) / 128);
+                nr0 = 2;
+                smem = 32*sizeof(float)*nr0;
             } break;
         case GGML_TYPE_NVFP4:
             {
@@ -1370,7 +1377,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
 
     const bool prec_bf16 = props_dev->has_bfloat &&
         ggml_prec_get_src(op, 1) == GGML_PREC_BF16 && tsrc1 == GGML_TYPE_F32 &&
-        tsrc0 != GGML_TYPE_BF16 && tsrc0 != GGML_TYPE_MXFP4 && tsrc0 != GGML_TYPE_NVFP4;
+        tsrc0 != GGML_TYPE_BF16 && tsrc0 != GGML_TYPE_MXFP4 && tsrc0 != GGML_TYPE_MXFP8 && tsrc0 != GGML_TYPE_NVFP4;
 
     const bool prec_f32 = ggml_prec_get_src(op, 1) == GGML_PREC_F32 && tsrc1 == GGML_TYPE_F32;
 
@@ -1471,6 +1478,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                // the thread layout of the BF16 kernel, see kernel_mul_mv_mxfp8_f32_impl
+                nsg = std::min(4, (ne00 + 127) / 128);
+                nr0 = 2;
+                smem = 32*sizeof(float)*nr0;
             } break;
         case GGML_TYPE_NVFP4:
             {

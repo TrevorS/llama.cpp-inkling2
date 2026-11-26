@@ -383,6 +383,7 @@ template [[host_name("kernel_mul_mm_tensor_f32_f32_prec_bf16")]] kernel mul_mm_t
 
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_tensor_bf16_f32")]]    kernel mul_mm_tensor_t kernel_mul_mm_tensor<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, float>;
+template [[host_name("kernel_mul_mm_tensor_mxfp8_f32")]]   kernel mul_mm_tensor_t kernel_mul_mm_tensor<bfloat, bfloat, block_mxfp8, 8, dequantize_mxfp8, float, float>;
 template [[host_name("kernel_mul_mm_tensor_bf16_bf16")]]   kernel mul_mm_tensor_t kernel_mul_mm_tensor<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, bfloat>;
 #endif
 template [[host_name("kernel_mul_mm_tensor_q1_0_f32")]]    kernel mul_mm_tensor_t kernel_mul_mm_tensor<half, half, block_q1_0,    8,     dequantize_q1_0,    float, float>;
@@ -447,6 +448,7 @@ template [[host_name("kernel_mul_mm_id_tensor_f32_f32")]]     kernel mul_mm_id_t
 template [[host_name("kernel_mul_mm_id_tensor_f16_f32")]]     kernel mul_mm_id_tensor_t kernel_mul_mm_id_tensor<half, half, half4x4,  1, dequantize_f16, half,  float>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_id_tensor_bf16_f32")]]    kernel mul_mm_id_tensor_t kernel_mul_mm_id_tensor<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, float>;
+template [[host_name("kernel_mul_mm_id_tensor_mxfp8_f32")]]   kernel mul_mm_id_tensor_t kernel_mul_mm_id_tensor<bfloat, bfloat, block_mxfp8, 8, dequantize_mxfp8, float, float>;
 #endif
 template [[host_name("kernel_mul_mm_id_tensor_q1_0_f32")]]    kernel mul_mm_id_tensor_t kernel_mul_mm_id_tensor<half, half, block_q1_0, 8, dequantize_q1_0, float, float>;
 template [[host_name("kernel_mul_mm_id_tensor_q2_0_f32")]]    kernel mul_mm_id_tensor_t kernel_mul_mm_id_tensor<half, half, block_q2_0, 4, dequantize_q2_0, float, float>;

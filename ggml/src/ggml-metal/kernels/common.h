@@ -77,6 +77,20 @@ static inline float ue4m3_to_fp32(uint8_t x) {
     return x == 0x7F ? 0.0f : v;
 }
 
+// E4M3: sign, 4 exponent bits with bias 7, 3 mantissa bits - the MXFP8 values
+static inline float e4m3_to_fp32(uint8_t x) {
+    const float v = (float) as_type<half>((ushort) ((x & 0x7F) << 7)) * 256.0f;
+
+    return as_type<float>(as_type<uint>(v) | ((uint) (x & 0x80) << 24));
+}
+
+// four E4M3 values of a word, as half: the sign and the 7 value bits move to the top of the half bits, the value is 2^-8 of the E4M3 value
+static inline half4 e4m3x4_to_half4_div256(uint32_t w) {
+    const ushort4 u = ushort4(w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF, w >> 24);
+
+    return as_type<half4>(((u & 0x80) << 8) | ((u & 0x7F) << 7));
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }
